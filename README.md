@@ -2,6 +2,16 @@
 [![GitHub CI](https://github.com/GiacomoPope/dilithium-py/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GiacomoPope/dilithium-py/actions/workflows/ci.yml)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
+# ML-DSA Message Recovery Version
+## Installation and Testing
+To install the message recovery version of `dilithium-py`, you can use the following command:
+
+```bash
+pip install -r requirements.txt
+python test.py
+```
+
+
 # CRYSTALS-Dilithium Python Implementation
 
 > [!CAUTION]
