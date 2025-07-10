@@ -19,6 +19,9 @@ class ML_DSA:
         self.gamma_2 = parameter_set["gamma_2"]
         self.beta = self.tau * self.eta
         self.c_tilde_bytes = parameter_set["c_tilde_bytes"]
+        self.h1_bytes = parameter_set["h1_bytes"]
+        self.h2_bytes = parameter_set["h2_bytes"]
+        self.r_bytes = parameter_set["r_bytes"]
 
         self.M = ModuleDilithium()
         self.R = self.M.ring
@@ -151,7 +154,7 @@ class ML_DSA:
 
         # Unpack vector bytes
         s1_bytes = sk_vec_bytes[:s1_len]
-        s2_bytes = sk_vec_bytes[s1_len : s1_len + s2_len]
+        s2_bytes = sk_vec_bytes[s1_len: s1_len + s2_len]
         t0_bytes = sk_vec_bytes[-t0_len:]
 
         # Unpack bytes to vectors
@@ -162,9 +165,9 @@ class ML_DSA:
         return rho, K, tr, s1, s2, t0
 
     def _unpack_h(self, h_bytes):
-        offsets = [0] + list(h_bytes[-self.k :])
+        offsets = [0] + list(h_bytes[-self.k:])
         non_zero_positions = [
-            list(h_bytes[offsets[i] : offsets[i + 1]]) for i in range(self.k)
+            list(h_bytes[offsets[i]: offsets[i + 1]]) for i in range(self.k)
         ]
 
         matrix = []
@@ -176,13 +179,12 @@ class ML_DSA:
         return self.M(matrix)
 
     def _unpack_sig(self, sig_bytes):
-        c_tilde = sig_bytes[: self.c_tilde_bytes]
-        z_bytes = sig_bytes[self.c_tilde_bytes : -(self.k + self.omega)]
-        h_bytes = sig_bytes[-(self.k + self.omega) :]
-
+        r = sig_bytes[: self.r_bytes]
+        z_bytes = sig_bytes[self.r_bytes: -(self.k + self.omega)]
+        h_bytes = sig_bytes[-(self.k + self.omega):]
         z = self.M.bit_unpack_z(z_bytes, self.l, 1, self.gamma_1)
         h = self._unpack_h(h_bytes)
-        return c_tilde, z, h
+        return r, z, h
 
     def _keygen_internal(self, zeta):
         """
@@ -226,6 +228,13 @@ class ML_DSA:
         # unpack the secret key
         rho, K, tr, s1, s2, t0 = self._unpack_sk(sk_bytes)
 
+        # split the first 64 byte of the message
+        if len(m) < self.h2_bytes:
+            # pad the m to 64 bytes
+            m = m.ljust(self.h2_bytes, b'\x00')
+        n = m[self.h2_bytes:]
+        m = m[:self.h2_bytes]
+
         # Precompute NTT representation
         s1_hat = s1.to_ntt()
         s2_hat = s2.to_ntt()
@@ -260,9 +269,21 @@ class ML_DSA:
             # Extract out only the high bits
             w1 = w.high_bits(alpha)
 
-            # Create challenge polynomial
+            # Compute w1 bytes
             w1_bytes = w1.bit_pack_w(self.gamma_2)
-            c_tilde = self._h(mu + w1_bytes, self.c_tilde_bytes)
+
+            # compute h1
+            h1 = self._h(w1_bytes + m, self.h1_bytes)
+
+            # compute h2=m xor _h(w1,h1)
+            h2 = bytes(a ^ b for a, b in zip(
+                self._h(w1_bytes + h1, self.h2_bytes), m))
+
+            # get r
+            r = h1 + h2
+
+            # Create challenge polynomial
+            c_tilde = self._h(n + r, self.c_tilde_bytes)
             c = self.R.sample_in_ball(c_tilde, self.tau)
             c_hat = c.to_ntt()
 
@@ -286,26 +307,32 @@ class ML_DSA:
             if h.sum_hint() > self.omega:
                 continue
 
-            return self._pack_sig(c_tilde, z, h)
+            print("Signature length:", len(self._pack_sig(r, z, h)))
+            print("Can recover %s bytes of the message" % self.h2_bytes)
 
-    def _verify_internal(self, pk_bytes, m, sig_bytes):
+            return self._pack_sig(r, z, h)
+
+    def _verify_internal(self, pk_bytes, n, sig_bytes):
         """
         Internal function to verify a signature sigma for a formatted message M'
         following Algorithm 8 (FIPS 204)
         """
         rho, t1 = self._unpack_pk(pk_bytes)
-        c_tilde, z, h = self._unpack_sig(sig_bytes)
+        r, z, h = self._unpack_sig(sig_bytes)
 
         if h.sum_hint() > self.omega:
+            print("Hint sum exceeds omega, verification failed")
             return False
 
         if z.check_norm_bound(self.gamma_1 - self.beta):
+            print("z does not satisfy norm bound, verification failed")
             return False
 
         A_hat = self._expand_matrix_from_seed(rho)
 
         tr = self._h(pk_bytes, 64)
-        mu = self._h(tr + m, 64)
+        # mu = self._h(tr + n, 64)
+        c_tilde = self._h(n + r, self.c_tilde_bytes)
         c = self.R.sample_in_ball(c_tilde, self.tau)
 
         # Convert to NTT for computation
@@ -321,7 +348,15 @@ class ML_DSA:
         w_prime = h.use_hint(Az_minus_ct1, 2 * self.gamma_2)
         w_prime_bytes = w_prime.bit_pack_w(self.gamma_2)
 
-        return c_tilde == self._h(mu + w_prime_bytes, self.c_tilde_bytes)
+        # split the first 64 bytes of the r
+        h1 = r[:self.h1_bytes]
+        h2 = r[self.h1_bytes:]
+
+        m = bytes(
+            a ^ b for a, b in zip(h2, self._h(w_prime_bytes + h1, self.h2_bytes))
+        )
+
+        return h1 == self._h(w_prime_bytes + m, self.h1_bytes)
 
     def keygen(self):
         """
@@ -366,12 +401,11 @@ class ML_DSA:
 
         # Format the message using the context
         m_prime = bytes([0]) + bytes([len(ctx)]) + ctx + m
-
         # Compute the signature of m_prime
         sig_bytes = self._sign_internal(sk_bytes, m_prime, rnd)
         return sig_bytes
 
-    def verify(self, pk_bytes, m, sig_bytes, ctx=b""):
+    def verify(self, pk_bytes, n, sig_bytes, ctx=b""):
         """
         Verifies a signature sigma for a message M following
         Algorithm 3 (FIPS 204)
@@ -382,9 +416,9 @@ class ML_DSA:
             )
 
         # Format the message using the context
-        m_prime = bytes([0]) + bytes([len(ctx)]) + ctx + m
+        # m_prime = bytes([0]) + bytes([len(ctx)]) + ctx + m
 
-        return self._verify_internal(pk_bytes, m_prime, sig_bytes)
+        return self._verify_internal(pk_bytes, n, sig_bytes)
 
     """
     The following external mu functions are not in FIPS 204, but are in
